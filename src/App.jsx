@@ -1,17 +1,16 @@
 /**
- * Taskenhower – Step 1.5 (no extra deps)
+ * Taskenhower – Step 2 (revised)
  *
+ * Updates based on your feedback:
+ * - Combined 2x2 grid for any selected matrices
+ * - “Manage matrices” tucked away
  *
- * This version:
- * - Keeps ONLY @dnd-kit/core (no sortable/utilities)
- * - Still supports:
- *   1) Drag between quadrants (lands at bottom)
- *   2) Reorder within a quadrant (drag onto another task)
- *
- * UI remains light: drag handle (⠿) only.
+ * New tweaks:
+ * - Focus selector now looks/behaves like the other toggle chips (consistent highlight)
+ * - New-task matrix defaults to the most recently selected matrix (focus if chosen, else last pinned toggled on)
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   DndContext,
   PointerSensor,
@@ -22,7 +21,20 @@ import {
 } from "@dnd-kit/core";
 
 const urgencyLevels = ["High", "Medium", "Low", "None"];
-const tags = ["Work", "Personal", "Goals"];
+
+const DEFAULT_MATRICES = [
+  { id: "work", name: "Work", pinned: true },
+  { id: "personal", name: "Personal", pinned: true },
+  { id: "goals", name: "Goals", pinned: true },
+];
+
+function slugify(input) {
+  return input
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+}
 
 function DroppableQuadrant({ id, className, children }) {
   const { isOver, setNodeRef } = useDroppable({ id });
@@ -37,12 +49,24 @@ function DroppableQuadrant({ id, className, children }) {
   );
 }
 
-function DraggableTaskRow({ task, onToggleComplete, onArchive, onDelete }) {
+function DroppableTaskTarget({ id, children }) {
+  const { setNodeRef } = useDroppable({ id });
+  return <div ref={setNodeRef}>{children}</div>;
+}
+
+function DraggableTaskRow({
+  task,
+  showMatrixBadge,
+  matrixName,
+  onToggleComplete,
+  onArchive,
+  onDelete,
+}) {
   const { attributes, listeners, setNodeRef, transform, isDragging } =
     useDraggable({
       id: task.id,
       data: {
-        tag: task.tag,
+        matrixId: task.matrixId,
         urgency: task.urgency,
       },
     });
@@ -61,17 +85,16 @@ function DraggableTaskRow({ task, onToggleComplete, onArchive, onDelete }) {
           onClick={() => onToggleComplete(task.id)}
           className={`w-3 h-3 rounded-full border-2 mt-1 ${
             task.status === "Completed"
-              ? "bg-green-500 border-green-600"
-              : "border-gray-400"
+              ? "bg-green-600 border-green-700"
+              : "border-slate-400"
           }`}
           title="Toggle complete"
         />
 
-        {/* Drag handle (light UI) */}
         <button
           {...listeners}
           {...attributes}
-          className="cursor-grab active:cursor-grabbing text-gray-400 hover:text-gray-600"
+          className="invisible group-hover:visible group-focus-within:visible cursor-grab active:cursor-grabbing text-gray-400 hover:text-gray-600"
           title="Drag"
           aria-label="Drag task"
         >
@@ -87,6 +110,15 @@ function DraggableTaskRow({ task, onToggleComplete, onArchive, onDelete }) {
         >
           {task.text}
         </span>
+
+        {showMatrixBadge && (
+          <span
+            className="text-[10px] px-1 py-0 rounded bg-slate-200/50 text-slate-500 leading-none opacity-70 tracking-tight whitespace-nowrap self-center"
+            title="Which matrix this task belongs to"
+          >
+            {matrixName}
+          </span>
+        )}
 
         <button
           onClick={() => onArchive(task.id)}
@@ -108,12 +140,6 @@ function DraggableTaskRow({ task, onToggleComplete, onArchive, onDelete }) {
   );
 }
 
-function DroppableTaskTarget({ id, children }) {
-  // Makes each task row a droppable target for reordering.
-  const { setNodeRef } = useDroppable({ id });
-  return <div ref={setNodeRef}>{children}</div>;
-}
-
 function arrayMove(items, from, to) {
   const next = items.slice();
   const [removed] = next.splice(from, 1);
@@ -123,39 +149,186 @@ function arrayMove(items, from, to) {
 
 export default function App() {
   const [tasks, setTasks] = useState([]);
+  const [matrices, setMatrices] = useState(DEFAULT_MATRICES);
   const [hasInitialized, setHasInitialized] = useState(false);
+
+  const [activePinnedIds, setActivePinnedIds] = useState(
+    DEFAULT_MATRICES.map((m) => m.id)
+  );
+  const [focusMatrixId, setFocusMatrixId] = useState("none");
+
+  // Tracks the most recently selected matrix (used as the default for new tasks)
+  const [lastSelectedMatrixId, setLastSelectedMatrixId] = useState("work");
+
+  const [newMatrixName, setNewMatrixName] = useState("");
+
   const [newTask, setNewTask] = useState({
     text: "",
-    tag: "Work",
+    matrixId: "work",
     urgency: "Medium",
   });
+
   const [showArchived, setShowArchived] = useState(false);
-  const [activeTags, setActiveTags] = useState(["Work"]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } })
   );
 
-  // ---------- persistence + migration (adds `order` to older tasks) ----------
+  // ---------- persistence ----------
   useEffect(() => {
-    const stored = localStorage.getItem("tasks");
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      setTasks(migrateOrdersIfMissing(parsed));
-    }
+    const storedMatrices = localStorage.getItem("matrices");
+    const loadedMatrices = storedMatrices
+      ? safeJsonParse(storedMatrices, DEFAULT_MATRICES)
+      : DEFAULT_MATRICES;
+
+    const normalizedMatrices = ensureDefaultPinnedMatrices(loadedMatrices);
+    setMatrices(normalizedMatrices);
+
+    const storedTasks = localStorage.getItem("tasks");
+    const loadedTasks = storedTasks ? safeJsonParse(storedTasks, []) : [];
+
+    const migratedTasks = migrateTasks(loadedTasks);
+    setTasks(migratedTasks);
+
+    const pinned = normalizedMatrices.filter((m) => m.pinned).map((m) => m.id);
+    setActivePinnedIds(pinned);
+
+    // best-effort default
+    setLastSelectedMatrixId(pinned[0] ?? "work");
+    setNewTask((t) => ({ ...t, matrixId: pinned[0] ?? "work" }));
+
     setHasInitialized(true);
   }, []);
 
   useEffect(() => {
-    if (hasInitialized) {
-      localStorage.setItem("tasks", JSON.stringify(tasks));
-    }
+    if (!hasInitialized) return;
+    localStorage.setItem("tasks", JSON.stringify(tasks));
   }, [tasks, hasInitialized]);
 
+  useEffect(() => {
+    if (!hasInitialized) return;
+    localStorage.setItem("matrices", JSON.stringify(matrices));
+  }, [matrices, hasInitialized]);
+
+  useEffect(() => {
+    if (!hasInitialized) return;
+    if (focusMatrixId === "none") return;
+    const exists = matrices.some((m) => m.id === focusMatrixId);
+    if (!exists) setFocusMatrixId("none");
+  }, [matrices, focusMatrixId, hasInitialized]);
+
+  // Keep newTask.matrixId aligned with the most recently selected matrix,
+  // but only when the input is empty (so we don’t disrupt someone mid-entry).
+  useEffect(() => {
+    if (!hasInitialized) return;
+    if (newTask.text.trim() !== "") return;
+    if (newTask.matrixId === lastSelectedMatrixId) return;
+    setNewTask((t) => ({ ...t, matrixId: lastSelectedMatrixId }));
+  }, [lastSelectedMatrixId, hasInitialized]);
+
+  // ---------- view model ----------
+  const pinnedMatrices = useMemo(
+    () => matrices.filter((m) => m.pinned),
+    [matrices]
+  );
+
+  const focusCandidates = useMemo(
+    () => matrices.filter((m) => !m.pinned),
+    [matrices]
+  );
+
+  const selectedMatrixIds = useMemo(() => {
+    const base = pinnedMatrices
+      .filter((m) => activePinnedIds.includes(m.id))
+      .map((m) => m.id);
+
+    if (
+      focusMatrixId !== "none" &&
+      focusCandidates.some((m) => m.id === focusMatrixId)
+    ) {
+      base.push(focusMatrixId);
+    }
+
+    return Array.from(new Set(base));
+  }, [pinnedMatrices, activePinnedIds, focusMatrixId, focusCandidates]);
+
+  const showMatrixBadges = selectedMatrixIds.length > 1;
+
+  const matrixNameById = useMemo(() => {
+    const map = new Map();
+    matrices.forEach((m) => map.set(m.id, m.name));
+    return map;
+  }, [matrices]);
+
+  // ---------- actions: matrices ----------
+  const addMatrix = () => {
+    const name = newMatrixName.trim();
+    if (!name) return;
+
+    const baseId = slugify(name);
+    if (!baseId) return;
+
+    const uniqueId = makeUniqueMatrixId(baseId, matrices);
+
+    setMatrices([
+      ...matrices,
+      {
+        id: uniqueId,
+        name,
+        pinned: false,
+      },
+    ]);
+
+    setNewMatrixName("");
+    setFocusMatrixId(uniqueId);
+    setLastSelectedMatrixId(uniqueId);
+    setNewTask((t) => ({ ...t, matrixId: uniqueId }));
+  };
+
+  const mergeMatrixInto = (sourceId, destId) => {
+    if (!sourceId || sourceId === "none") return;
+    if (!destId || sourceId === destId) return;
+
+    setTasks((prev) => {
+      const moved = prev.map((t) =>
+        t.matrixId === sourceId ? { ...t, matrixId: destId } : t
+      );
+      let next = moved;
+      urgencyLevels.forEach((u) => {
+        next = normalizeOrders(next, destId, u);
+      });
+      return next;
+    });
+
+    setMatrices((prev) => prev.filter((m) => m.id !== sourceId));
+    setFocusMatrixId("none");
+    setLastSelectedMatrixId(destId);
+  };
+
+  const deleteMatrixArchiveTasks = (matrixId) => {
+    if (!matrixId || matrixId === "none") return;
+
+    setTasks((prev) =>
+      prev.map((t) =>
+        t.matrixId === matrixId && t.status !== "Deleted"
+          ? { ...t, status: "Archived" }
+          : t
+      )
+    );
+
+    setMatrices((prev) => prev.filter((m) => m.id !== matrixId));
+    setFocusMatrixId("none");
+
+    // fallback to a sensible default
+    const fallback = activePinnedIds[0] ?? "work";
+    setLastSelectedMatrixId(fallback);
+  };
+
+  // ---------- actions: tasks ----------
   const addTask = () => {
     if (!newTask.text.trim()) return;
 
-    const nextOrder = getNextOrder(tasks, newTask.tag, newTask.urgency);
+    const nextOrder = getNextOrder(tasks, newTask.matrixId, newTask.urgency);
 
     setTasks([
       ...tasks,
@@ -167,14 +340,17 @@ export default function App() {
       },
     ]);
 
-    setNewTask({ text: "", tag: "Work", urgency: "Medium" });
+    setNewTask({ text: "", matrixId: newTask.matrixId, urgency: "Medium" });
   };
 
   const toggleComplete = (id) =>
     setTasks(
       tasks.map((t) =>
         t.id === id
-          ? { ...t, status: t.status === "Completed" ? "Not Done" : "Completed" }
+          ? {
+              ...t,
+              status: t.status === "Completed" ? "Not Done" : "Completed",
+            }
           : t
       )
     );
@@ -190,6 +366,126 @@ export default function App() {
   const deleteTask = (id) => {
     setTasks(tasks.map((t) => (t.id === id ? { ...t, status: "Deleted" } : t)));
   };
+
+  // ---------- helpers ----------
+  function safeJsonParse(str, fallback) {
+    try {
+      return JSON.parse(str);
+    } catch {
+      return fallback;
+    }
+  }
+
+  function ensureDefaultPinnedMatrices(list) {
+    const byId = new Map(list.map((m) => [m.id, m]));
+    DEFAULT_MATRICES.forEach((m) => {
+      if (!byId.has(m.id)) byId.set(m.id, m);
+      else {
+        const existing = byId.get(m.id);
+        byId.set(m.id, { ...existing, name: m.name, pinned: true });
+      }
+    });
+    return Array.from(byId.values());
+  }
+
+  function makeUniqueMatrixId(baseId, list) {
+    let id = baseId;
+    let n = 2;
+    while (list.some((m) => m.id === id)) {
+      id = `${baseId}-${n}`;
+      n += 1;
+    }
+    return id;
+  }
+
+  function migrateTasks(allTasks) {
+    const migrated = allTasks.map((t) => {
+      if (t.matrixId) return t;
+
+      const tag = t.tag;
+      let matrixId = "work";
+      if (tag === "Personal") matrixId = "personal";
+      if (tag === "Goals") matrixId = "goals";
+
+      const { tag: _tag, ...rest } = t;
+      return { ...rest, matrixId };
+    });
+
+    const hasAnyOrder = migrated.some((t) => typeof t.order === "number");
+    if (hasAnyOrder) return migrated;
+
+    const counters = new Map();
+    return migrated.map((t) => {
+      const key = `${t.matrixId}__${t.urgency}`;
+      const next = counters.get(key) ?? 0;
+      counters.set(key, next + 1);
+      return { ...t, order: next };
+    });
+  }
+
+  function getTaskById(id) {
+    return tasks.find((t) => t.id === id);
+  }
+
+  function getVisibleTasksForQuadrant(selectedIds, urgency) {
+    return tasks
+      .filter(
+        (t) =>
+          selectedIds.includes(t.matrixId) &&
+          t.urgency === urgency &&
+          t.status !== "Archived" &&
+          t.status !== "Deleted"
+      )
+      .sort((a, b) => {
+        if (a.matrixId !== b.matrixId) {
+          const an = matrixNameById.get(a.matrixId) ?? a.matrixId;
+          const bn = matrixNameById.get(b.matrixId) ?? b.matrixId;
+          return an.localeCompare(bn);
+        }
+        const ao = typeof a.order === "number" ? a.order : 0;
+        const bo = typeof b.order === "number" ? b.order : 0;
+        if (ao !== bo) return ao - bo;
+        return a.id - b.id;
+      });
+  }
+
+  function getNextOrder(allTasks, matrixId, urgency) {
+    const max = allTasks
+      .filter(
+        (t) =>
+          t.matrixId === matrixId &&
+          t.urgency === urgency &&
+          t.status !== "Archived" &&
+          t.status !== "Deleted" &&
+          typeof t.order === "number"
+      )
+      .reduce((m, t) => Math.max(m, t.order), -1);
+    return max + 1;
+  }
+
+  function normalizeOrders(allTasks, matrixId, urgency) {
+    const group = allTasks
+      .filter(
+        (t) =>
+          t.matrixId === matrixId &&
+          t.urgency === urgency &&
+          t.status !== "Archived" &&
+          t.status !== "Deleted"
+      )
+      .sort((a, b) => {
+        const ao = typeof a.order === "number" ? a.order : 0;
+        const bo = typeof b.order === "number" ? b.order : 0;
+        if (ao !== bo) return ao - bo;
+        return a.id - b.id;
+      });
+
+    const updates = new Map();
+    group.forEach((t, idx) => updates.set(t.id, idx));
+
+    return allTasks.map((t) =>
+      updates.has(t.id) ? { ...t, order: updates.get(t.id) } : t
+    );
+  }
 
   const quadrantLabel = (urgency) => {
     switch (urgency) {
@@ -216,87 +512,7 @@ export default function App() {
     return classMap[urgency] || "";
   };
 
-  // ---------- helpers ----------
-  function getTaskById(id) {
-    return tasks.find((t) => t.id === id);
-  }
-
-  function getVisibleTasksForQuadrant(tagList, urgency) {
-    return tasks
-      .filter(
-        (t) =>
-          tagList.includes(t.tag) &&
-          t.urgency === urgency &&
-          t.status !== "Archived" &&
-          t.status !== "Deleted"
-      )
-      .sort((a, b) => {
-        const ao = typeof a.order === "number" ? a.order : 0;
-        const bo = typeof b.order === "number" ? b.order : 0;
-        if (ao !== bo) return ao - bo;
-        return a.id - b.id;
-      });
-  }
-
-  function getNextOrder(allTasks, tag, urgency) {
-    const max = allTasks
-      .filter(
-        (t) =>
-          t.tag === tag &&
-          t.urgency === urgency &&
-          t.status !== "Archived" &&
-          t.status !== "Deleted" &&
-          typeof t.order === "number"
-      )
-      .reduce((m, t) => Math.max(m, t.order), -1);
-    return max + 1;
-  }
-
-  function migrateOrdersIfMissing(allTasks) {
-    const hasAnyOrder = allTasks.some((t) => typeof t.order === "number");
-    if (hasAnyOrder) return allTasks;
-
-    const counters = new Map();
-
-    return allTasks.map((t) => {
-      const key = `${t.tag}__${t.urgency}`;
-      const next = counters.get(key) ?? 0;
-      counters.set(key, next + 1);
-      return { ...t, order: next };
-    });
-  }
-
-  function normalizeOrders(allTasks, tag, urgency) {
-    const group = allTasks
-      .filter(
-        (t) =>
-          t.tag === tag &&
-          t.urgency === urgency &&
-          t.status !== "Archived" &&
-          t.status !== "Deleted"
-      )
-      .sort((a, b) => {
-        const ao = typeof a.order === "number" ? a.order : 0;
-        const bo = typeof b.order === "number" ? b.order : 0;
-        if (ao !== bo) return ao - bo;
-        return a.id - b.id;
-      });
-
-    const updates = new Map();
-    group.forEach((t, idx) => updates.set(t.id, idx));
-
-    return allTasks.map((t) =>
-      updates.has(t.id) ? { ...t, order: updates.get(t.id) } : t
-    );
-  }
-
-  // ---------- DnD behavior ----------
-  // Rules:
-  // - Drop onto a quadrant container id: move to that urgency, place at bottom.
-  // - Drop onto another task id:
-  //   - If same (tag + urgency): reorder within that group.
-  //   - If different urgency: move to that urgency, place at bottom.
-  //   - If different tag: ignore (keeps cross-tag behavior predictable when multiple tags are shown).
+  // ---------- DnD behavior in combined view ----------
   const handleDragEnd = ({ active, over }) => {
     if (!over) return;
 
@@ -306,51 +522,47 @@ export default function App() {
     const activeTask = getTaskById(activeId);
     if (!activeTask) return;
 
-    // Dropped on quadrant background
+    if (!selectedMatrixIds.includes(activeTask.matrixId)) return;
+
     if (urgencyLevels.includes(overId)) {
       if (activeTask.urgency === overId) return;
 
       setTasks((prev) => {
-        const nextOrder = getNextOrder(prev, activeTask.tag, overId); // bottom
+        const nextOrder = getNextOrder(prev, activeTask.matrixId, overId);
         const moved = prev.map((t) =>
           t.id === activeId ? { ...t, urgency: overId, order: nextOrder } : t
         );
-        // normalize source quadrant so it stays tidy
-        return normalizeOrders(moved, activeTask.tag, activeTask.urgency);
+        return normalizeOrders(moved, activeTask.matrixId, activeTask.urgency);
       });
 
       return;
     }
 
-    // Dropped on another task (for reorder or move)
     const overTask = getTaskById(overId);
     if (!overTask) return;
 
-    // Cross-tag drops are ignored to avoid strange behavior when multiple tags are displayed.
-    if (overTask.tag !== activeTask.tag) return;
+    if (overTask.matrixId !== activeTask.matrixId) return;
 
-    // Different urgency => move to that urgency (bottom)
     if (overTask.urgency !== activeTask.urgency) {
       setTasks((prev) => {
-        const nextOrder = getNextOrder(prev, activeTask.tag, overTask.urgency); // bottom
+        const nextOrder = getNextOrder(prev, activeTask.matrixId, overTask.urgency);
         const moved = prev.map((t) =>
           t.id === activeId
             ? { ...t, urgency: overTask.urgency, order: nextOrder }
             : t
         );
-        return normalizeOrders(moved, activeTask.tag, activeTask.urgency);
+        return normalizeOrders(moved, activeTask.matrixId, activeTask.urgency);
       });
       return;
     }
 
-    // Same (tag + urgency): reorder
     if (activeId === overId) return;
 
     setTasks((prev) => {
       const group = prev
         .filter(
           (t) =>
-            t.tag === activeTask.tag &&
+            t.matrixId === activeTask.matrixId &&
             t.urgency === activeTask.urgency &&
             t.status !== "Archived" &&
             t.status !== "Deleted"
@@ -377,20 +589,27 @@ export default function App() {
     });
   };
 
-  const renderMatrix = (tagsToRender) => {
-    const relevantTags = Array.isArray(tagsToRender) ? tagsToRender : [tagsToRender];
+  const focusMatrix =
+    focusMatrixId === "none" ? null : matrices.find((m) => m.id === focusMatrixId);
 
+  const isFocusActive = focusMatrixId !== "none";
+
+  const renderCombinedMatrix = () => {
     return (
       <div className="mb-10">
         <h2 className="text-xl font-bold mb-4 text-gray-800 border-b pb-1 text-center">
-          {relevantTags.join(" + ")} Tasks
+          {selectedMatrixIds.length === 0
+            ? "No matrices selected"
+            : `${selectedMatrixIds
+                .map((id) => matrixNameById.get(id) ?? id)
+                .join(" + ")} Tasks`}
         </h2>
 
         <div className="flex justify-center">
           <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
             <div className="grid grid-cols-2 gap-4 w-full max-w-3xl px-4 auto-rows-fr">
               {urgencyLevels.map((level) => {
-                const visibleTasks = getVisibleTasksForQuadrant(relevantTags, level);
+                const visibleTasks = getVisibleTasksForQuadrant(selectedMatrixIds, level);
 
                 return (
                   <div key={level} className="min-h-[140px]">
@@ -407,6 +626,8 @@ export default function App() {
                             <DroppableTaskTarget key={task.id} id={task.id}>
                               <DraggableTaskRow
                                 task={task}
+                                showMatrixBadge={showMatrixBadges}
+                                matrixName={matrixNameById.get(task.matrixId) ?? task.matrixId}
                                 onToggleComplete={toggleComplete}
                                 onArchive={archiveTask}
                                 onDelete={deleteTask}
@@ -433,29 +654,67 @@ export default function App() {
           Taskenhower Matrix
         </h1>
 
-        <div className="mb-6 flex justify-center gap-4">
-          {tags.map((tag) => {
-            const isActive = activeTags.includes(tag);
+        {/* Pinned toggles + Focus chip */}
+        <div className="mb-6 flex flex-wrap justify-center gap-3 items-center">
+          {pinnedMatrices.map((m) => {
+            const isActive = activePinnedIds.includes(m.id);
             return (
               <button
-                key={tag}
+                key={m.id}
                 className={`px-4 py-1 rounded text-sm border transition-colors ${
-                  isActive ? "bg-blue-600 text-white" : "bg-white text-blue-600"
+                  isActive ? "bg-indigo-600 text-white" : "bg-white text-indigo-600 hover:bg-indigo-50"
                 }`}
-                onClick={() =>
-                  setActiveTags((prev) =>
-                    prev.includes(tag)
-                      ? prev.filter((t) => t !== tag)
-                      : [...prev, tag]
-                  )
-                }
+                onClick={() => {
+                  setActivePinnedIds((prev) => {
+                    const next = prev.includes(m.id)
+                      ? prev.filter((id) => id !== m.id)
+                      : [...prev, m.id];
+                    return next;
+                  });
+
+                  // If turning on, treat it as the most-recent selection
+                  setLastSelectedMatrixId((prevLast) => {
+                    const willBeActive = !activePinnedIds.includes(m.id);
+                    return willBeActive ? m.id : prevLast;
+                  });
+                }}
+                title="Toggle matrix"
               >
-                {tag}
+                {m.name}
               </button>
             );
           })}
+
+          {/* Focus chip (styled like the others) */}
+          <div
+            className={`px-3 py-1 rounded text-sm border transition-colors flex items-center gap-2 ${
+              isFocusActive ? "bg-indigo-600 text-white" : "bg-white text-indigo-600 hover:bg-indigo-50"
+            }`}
+            title="Select a focus matrix"
+          >
+            <span className="text-sm">Focus:</span>
+            <select
+              className={`text-sm outline-none bg-transparent ${
+                isFocusActive ? "text-white" : "text-indigo-600"
+              }`}
+              value={focusMatrixId}
+              onChange={(e) => {
+                const next = e.target.value;
+                setFocusMatrixId(next);
+                if (next !== "none") setLastSelectedMatrixId(next);
+              }}
+            >
+              <option value="none">None</option>
+              {focusCandidates.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
 
+        {/* Add task */}
         <div className="mb-10 flex flex-wrap gap-3 items-end justify-center">
           <input
             className="border border-gray-300 p-2 rounded flex-1 min-w-[180px]"
@@ -469,11 +728,18 @@ export default function App() {
 
           <select
             className="border border-gray-300 p-2 rounded"
-            value={newTask.tag}
-            onChange={(e) => setNewTask({ ...newTask, tag: e.target.value })}
+            value={newTask.matrixId}
+            onChange={(e) => {
+              const id = e.target.value;
+              setNewTask({ ...newTask, matrixId: id });
+              setLastSelectedMatrixId(id);
+            }}
+            title="Which matrix should this task live in?"
           >
-            {tags.map((tag) => (
-              <option key={tag}>{tag}</option>
+            {matrices.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name}
+              </option>
             ))}
           </select>
 
@@ -488,7 +754,7 @@ export default function App() {
           </select>
 
           <button
-            className="bg-blue-600 text-white px-4 py-2 rounded"
+            className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded"
             onClick={addTask}
           >
             Add
@@ -496,12 +762,62 @@ export default function App() {
         </div>
 
         <div className="mt-6">
-          {activeTags.length === 0 ? (
+          {selectedMatrixIds.length === 0 ? (
             <p className="text-center text-gray-500">Select a matrix above.</p>
           ) : (
-            renderMatrix(activeTags)
+            renderCombinedMatrix()
           )}
         </div>
+
+        {/* Manage matrices (tucked away) */}
+        <details className="mt-4 max-w-3xl mx-auto">
+          <summary className="cursor-pointer text-sm text-slate-600 underline">
+            Manage matrices
+          </summary>
+          <div className="mt-4 space-y-4">
+            <div className="flex flex-wrap gap-3 items-end justify-center">
+              <input
+                className="border border-gray-300 p-2 rounded flex-1 min-w-[200px]"
+                placeholder="New matrix name (e.g., Today 2/10/26, Project XYZ)"
+                value={newMatrixName}
+                onChange={(e) => setNewMatrixName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") addMatrix();
+                }}
+              />
+              <button
+                className="bg-slate-800 text-white px-4 py-2 rounded"
+                onClick={addMatrix}
+              >
+                Add Matrix
+              </button>
+            </div>
+
+            {focusMatrix && (
+              <div className="flex flex-wrap gap-3 justify-center items-center">
+                <div className="text-sm text-slate-600">
+                  Focus:{" "}
+                  <span className="font-semibold text-slate-800">
+                    {focusMatrix.name}
+                  </span>
+                </div>
+
+                <MergeControl
+                  pinnedMatrices={pinnedMatrices}
+                  onMerge={(destId) => mergeMatrixInto(focusMatrix.id, destId)}
+                />
+
+                <button
+                  className="text-sm text-red-600 underline"
+                  onClick={() => deleteMatrixArchiveTasks(focusMatrix.id)}
+                  title="Delete matrix (archives its tasks)"
+                >
+                  Delete focus (archive tasks)
+                </button>
+              </div>
+            )}
+          </div>
+        </details>
 
         <div className="mt-10">
           <div className="flex justify-center gap-3">
@@ -526,20 +842,31 @@ export default function App() {
               <div className="space-y-2">
                 {tasks
                   .filter((t) => t.status === "Archived")
-                  .map((task) => (
-                    <div
-                      key={task.id}
-                      className="flex items-center justify-between bg-slate-50 border rounded p-2"
-                    >
-                      <span className="text-sm text-gray-700">{task.text}</span>
-                      <button
-                        className="text-xs text-blue-600 underline"
-                        onClick={() => unarchiveTask(task.id)}
+                  .map((task) => {
+                    const matrixName =
+                      matrixNameById.get(task.matrixId) ?? "Unknown";
+                    return (
+                      <div
+                        key={task.id}
+                        className="flex items-center justify-between bg-slate-50 border rounded p-2"
                       >
-                        Unarchive
-                      </button>
-                    </div>
-                  ))}
+                        <div className="flex flex-col">
+                          <span className="text-sm text-gray-700">
+                            {task.text}
+                          </span>
+                          <span className="text-xs text-gray-500">
+                            {matrixName}
+                          </span>
+                        </div>
+                        <button
+                          className="text-xs text-blue-600 underline"
+                          onClick={() => unarchiveTask(task.id)}
+                        >
+                          Unarchive
+                        </button>
+                      </div>
+                    );
+                  })}
               </div>
             </div>
           )}
@@ -548,4 +875,44 @@ export default function App() {
     </div>
   );
 }
+
+function MergeControl({ pinnedMatrices, onMerge }) {
+  const [destId, setDestId] = useState(pinnedMatrices[0]?.id ?? "work");
+
+  useEffect(() => {
+    if (pinnedMatrices.length && !pinnedMatrices.some((m) => m.id === destId)) {
+      setDestId(pinnedMatrices[0].id);
+    }
+  }, [pinnedMatrices, destId]);
+
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-sm text-slate-600">Merge into</span>
+      <select
+        className="border border-gray-300 p-2 rounded text-sm"
+        value={destId}
+        onChange={(e) => setDestId(e.target.value)}
+        title="Choose destination matrix"
+      >
+        {pinnedMatrices.map((m) => (
+          <option key={m.id} value={m.id}>
+            {m.name}
+          </option>
+        ))}
+      </select>
+      <button
+        className="text-sm text-slate-800 underline"
+        onClick={() => onMerge(destId)}
+        title="Merge focus matrix into selected pinned matrix"
+      >
+        Merge
+      </button>
+    </div>
+  );
+}
+
+
+
+
+
 
