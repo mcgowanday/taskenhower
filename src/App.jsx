@@ -61,6 +61,12 @@ function DraggableTaskRow({
   onToggleComplete,
   onArchive,
   onDelete,
+  isEditing,
+  draftText,
+  onStartEdit,
+  onChangeDraft,
+  onCommitEdit,
+  onCancelEdit,
 }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } =
     useDraggable({
@@ -101,15 +107,31 @@ function DraggableTaskRow({
           ⠿
         </button>
 
-        <span
-          className={`flex-1 ${
-            task.status === "Completed"
-              ? "line-through text-gray-400"
-              : "text-gray-800"
-          }`}
-        >
-          {task.text}
-        </span>
+        {isEditing ? (
+          <input
+            className="flex-1 border border-slate-300 rounded px-2 py-1 text-sm bg-white"
+            value={draftText}
+            autoFocus
+            onChange={(e) => onChangeDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") onCommitEdit();
+              if (e.key === "Escape") onCancelEdit();
+            }}
+            onBlur={() => onCommitEdit()}
+          />
+        ) : (
+          <span
+            className={`flex-1 cursor-text ${
+              task.status === "Completed"
+                ? "line-through text-gray-400"
+                : "text-gray-800"
+            }`}
+            onDoubleClick={() => onStartEdit()}
+            title="Double-click to edit"
+          >
+            {task.text}
+          </span>
+        )}
 
         {showMatrixBadge && (
           <span
@@ -169,6 +191,10 @@ export default function App() {
   });
 
   const [showArchived, setShowArchived] = useState(false);
+
+  // Inline edit state
+  const [editingTaskId, setEditingTaskId] = useState(null);
+  const [editDraft, setEditDraft] = useState("");
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } })
@@ -364,7 +390,42 @@ export default function App() {
   };
 
   const deleteTask = (id) => {
+    // If we delete the task we were editing, exit edit mode
+    if (editingTaskId === id) {
+      setEditingTaskId(null);
+      setEditDraft("");
+    }
     setTasks(tasks.map((t) => (t.id === id ? { ...t, status: "Deleted" } : t)));
+  };
+
+  // ---------- inline edit handlers ----------
+  const startEdit = (task) => {
+    if (!task) return;
+    setEditingTaskId(task.id);
+    setEditDraft(task.text);
+  };
+
+  const cancelEdit = () => {
+    setEditingTaskId(null);
+    setEditDraft("");
+  };
+
+  const commitEdit = () => {
+    if (editingTaskId == null) return;
+    const nextText = editDraft.trim();
+
+    // Don’t allow empty text; if empty, just cancel.
+    if (!nextText) {
+      cancelEdit();
+      return;
+    }
+
+    setTasks((prev) =>
+      prev.map((t) => (t.id === editingTaskId ? { ...t, text: nextText } : t))
+    );
+
+    setEditingTaskId(null);
+    setEditDraft("");
   };
 
   // ---------- helpers ----------
@@ -631,6 +692,12 @@ export default function App() {
                                 onToggleComplete={toggleComplete}
                                 onArchive={archiveTask}
                                 onDelete={deleteTask}
+                                isEditing={editingTaskId === task.id}
+                                draftText={editingTaskId === task.id ? editDraft : task.text}
+                                onStartEdit={() => startEdit(task)}
+                                onChangeDraft={setEditDraft}
+                                onCommitEdit={commitEdit}
+                                onCancelEdit={cancelEdit}
                               />
                             </DroppableTaskTarget>
                           ))}
@@ -910,6 +977,7 @@ function MergeControl({ pinnedMatrices, onMerge }) {
     </div>
   );
 }
+
 
 
 
